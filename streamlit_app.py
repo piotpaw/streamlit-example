@@ -1,101 +1,274 @@
-import matplotlib.pyplot as plt
-import numpy as np
+# ======================================================================
+# HARWICH-FORMATION BOREHOLES – INTERACTIVE VIEWER
+# ======================================================================
+####
+
 import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import pydeck as pdk
+from pyproj import Transformer
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import matplotlib.colors as mcolors
+import random
 
-# --- PAGE CONFIG --- #
-st.set_page_config(
-    page_title="Hardening Soil Model",
-    layout="wide"
+# ----------------------------------------------------------------------
+# 0. Streamlit page
+# ----------------------------------------------------------------------
+st.set_page_config(page_title="Harwich Formation Boreholes", layout="wide")
+st.title("Boreholes that Intercept the Harwich Formation")
+
+# ----------------------------------------------------------------------
+# 1. Pick an AGS workbook in the current directory
+# ----------------------------------------------------------------------
+xlsx_files = [f for f in os.listdir()
+              if f.lower().endswith(".xlsx") and not f.startswith("~$")]
+
+excel_file = st.selectbox(
+    "Available .xlsx files in this folder:",
+    options=xlsx_files,
+    index=0 if xlsx_files else None,
+    placeholder="Choose an AGS workbook"
 )
 
-# --- SIDEBAR --- #
-sb = st.sidebar
-max_depth = sb.slider(
-    "Maximum depth for figure (m)", min_value=10, max_value=100, value=20
+if not excel_file:
+    st.warning("No AGS Excel (.xlsx) files found in this folder.")
+    st.stop()
+
+# ----------------------------------------------------------------------
+# 2. Read LOCA & GEOL sheets
+# ----------------------------------------------------------------------
+LOCA_SHEET = "LOCA - AGS"
+GEOL_SHEET = "GEOL - AGS"
+GEOL_COLS  = ["LOCA_ID",
+              "LOCA_GL",
+              "GEOL_TOP",
+              "GEOL_BASE",
+              "COWI GEOL_2",
+              "COWI GEOL_4"]
+
+try:
+    # ---- LOCA ----
+    loca_df = pd.read_excel(excel_file, sheet_name=LOCA_SHEET, header=3)
+    loca_df.columns = loca_df.columns.str.strip()
+    loca_df = loca_df[["LOCA_ID", "LOCA_NATE", "LOCA_NATN"]]
+
+    loca_df[["LOCA_NATE", "LOCA_NATN"]] = loca_df[["LOCA_NATE", "LOCA_NATN"]].apply(
+        pd.to_numeric, errors="coerce")
+    loca_df = loca_df.dropna(subset=["LOCA_NATE", "LOCA_NATN"])
+
+    transformer = Transformer.from_crs("epsg:27700", "epsg:4326", always_xy=True)
+
+    def osgb_to_latlon(row):
+        try:
+            lon, lat = transformer.transform(float(row["LOCA_NATE"]),
+                                             float(row["LOCA_NATN"]))
+            return pd.Series({"LAT": lat, "LON": lon})
+        except Exception:
+            return pd.Series({"LAT": np.nan, "LON": np.nan})
+
+    loca_df[["LAT", "LON"]] = loca_df.apply(osgb_to_latlon, axis=1)
+    loca_df = loca_df.dropna(subset=["LAT", "LON"])
+
+    # ---- GEOL ----
+    geol_df = pd.read_excel(excel_file,
+                            sheet_name=GEOL_SHEET,
+                            usecols=GEOL_COLS)
+    geol_df.columns = geol_df.columns.str.strip()
+
+except Exception as e:
+    st.error(f"Error loading AGS file: {e}\n\n"
+             "Check sheet names, header rows and column names.")
+    st.stop()
+
+# ----------------------------------------------------------------------
+# 3. Keep ONLY boreholes that mention “Harwich” in GEOL_2 or GEOL_4
+# ----------------------------------------------------------------------
+def contains_harwich(series: pd.Series) -> pd.Series:
+    return series.astype(str).str.upper().str.contains("HARWICH", na=False)
+
+harwich_mask = (
+    contains_harwich(geol_df["COWI GEOL_2"]) |
+    contains_harwich(geol_df["COWI GEOL_4"])
 )
-sb.markdown(
-    "Read about Hardening Soil in [this blog post.](https://berkdemir.github.io/2021/05/11/Hardening-Soil-Model/)"
-)
-sb.caption(
-    "Boussinesq only for vertical stress; horizontal = K0 * vertical."
-)
+harwich_ids = geol_df.loc[harwich_mask, "LOCA_ID"].unique()
 
-# --- MAIN TITLE --- #
-st.title("Hardening Soil Model | Effect of Power m")
-
-# --- PARAMETER INPUTS --- #
-columns = st.columns([1, 1, 3])
-with columns[0]:
-    B = st.slider("Width of Foundation (m)", 1, 100, 20)
-    L = st.slider("Length of Foundation (m)", 1, 100, 40)
-    q = st.slider("Pressure on Foundation (kPa)", 0, 500, 100)
-    UW = st.slider("Unit Weight of Soil (kN/m3)", 0, 25, 20)
-    K0 = st.slider("Coefficient of Lateral Earth Pressure", 0.0, 2.0, 0.5)
-
-with columns[1]:
-    m = st.slider("Power m", 0.0, 1.0, 0.55)
-    pref = st.slider("Reference Pressure, pref (kPa)", 10, 500, 100)
-    E50ref = st.slider("E50ref (MPa)", 10, 500, 50)
-    c = st.slider("Cohesion (kPa)", 0, 200, 20)
-    phi = st.slider("Angle of Friction (deg)", 0, 45, 30)
-
-# --- CORE CALCULATIONS --- #
-def boussinesq(L, B, z, q):
-    mL = L / B
-    b = B / 2
-    n = z / b
-    I = (
-        (
-            mL * n * (1 + mL**2 + 2*n**2) /
-            np.sqrt(1 + mL**2 + n**2) /
-            (1 + n**2) /
-            (mL**2 + n**2)
-            + np.arcsin(mL / (np.sqrt(mL**2 + n**2) * np.sqrt(1 + n**2)))
-        ) * 2 / np.pi
+if len(harwich_ids) == 0:
+    st.warning(
+        "No intervals contain the word 'Harwich'.\n\n"
+        "Distinct values found in COWI GEOL_2 and GEOL_4 are listed below."
     )
-    return q * I
+    col1, col2 = st.columns(2)
+    with col1:
+        st.write("COWI GEOL_2")
+        st.dataframe(pd.DataFrame(geol_df["COWI GEOL_2"].unique(),
+                                  columns=["COWI GEOL_2"]),
+                     hide_index=True)
+    with col2:
+        st.write("COWI GEOL_4")
+        st.dataframe(pd.DataFrame(geol_df["COWI GEOL_4"].unique(),
+                                  columns=["COWI GEOL_4"]),
+                     hide_index=True)
+    st.stop()
 
-def Ecalc(E50ref, q, K0, m, pref, c, phi):
-    return E50ref * (
-        (c * np.cos(np.radians(phi)) + q * K0 * np.sin(np.radians(phi))) /
-        (c * np.cos(np.radians(phi)) + pref * np.sin(np.radians(phi)))
-    ) ** m
+loca_df = loca_df[loca_df["LOCA_ID"].isin(harwich_ids)].reset_index(drop=True)
+geol_df = geol_df[geol_df["LOCA_ID"].isin(harwich_ids)]
 
-depth = np.arange(0, max_depth+1, 1)
-qred = []
-E50_load = []
-E50_load_m0 = []
-E50_load_m05 = []
-E50_load_m1 = []
+# ----------------------------------------------------------------------
+# 4. Colour palette for lithology (COWI GEOL_4)
+# ----------------------------------------------------------------------
+unique_desc = geol_df["COWI GEOL_4"].dropna().unique()
+palette = (list(mcolors.TABLEAU_COLORS.values()) +
+           list(mcolors.XKCD_COLORS.values()))
+random.shuffle(palette)
+DESC_COLOUR = {d: palette[i % len(palette)] for i, d in enumerate(unique_desc)}
+DEFAULT_COLOUR = "#cccccc"
 
-for i in depth:
-    q_eff = boussinesq(L, B, i, q) + UW * i
-    qred.append(q_eff)
-    E50_load.append(Ecalc(E50ref, q_eff, K0, m, pref, c, phi))
-    E50_load_m0.append(Ecalc(E50ref, q_eff, K0, 0, pref, c, phi))
-    E50_load_m05.append(Ecalc(E50ref, q_eff, K0, 0.5, pref, c, phi))
-    E50_load_m1.append(Ecalc(E50ref, q_eff, K0, 1, pref, c, phi))
+# ----------------------------------------------------------------------
+# 5. Layout – right: map, left: lithology stick
+# ----------------------------------------------------------------------
+left_col, right_col = st.columns([1, 2])
 
-# --- PLOTTING --- #
-fig, ax = plt.subplots(1, 2, figsize=(10, 6), sharey=True)
-ax[0].plot(qred, depth, label="Pressure with Depth", color="red")
-ax[0].set_xlabel("Pressure (kPa)")
-ax[0].set_ylabel("Depth (m)")
-ax[0].invert_yaxis()
-ax[0].legend(fontsize=8)
-ax[0].set_title("Pressure Difference with Depth (Boussinesq)")
+# --------------------------- Map --------------------------------------
+with right_col:
+    st.subheader("Harwich borehole locations")
 
-ax[1].plot(E50_load, depth, label=f"m = {m:.2f}", color="red")
-ax[1].plot(E50_load_m0, depth, label="m = 0", color="red", ls="--", lw=1)
-ax[1].plot(E50_load_m05, depth, label="m = 0.5", color="green", ls="--", lw=0.5)
-ax[1].plot(E50_load_m1, depth, label="m = 1", color="gray", ls="--", lw=1)
-ax[1].set_xlabel("E50 (MPa)")
-ax[1].legend(fontsize=8)
-ax[1].set_title("E50 with Depth")
-ax[1].fill_betweenx(depth, E50_load_m1, E50_load_m0, color="gray", alpha=0.1)
+    view_state = pdk.ViewState(
+        longitude=loca_df["LON"].mean(),
+        latitude=loca_df["LAT"].mean(),
+        zoom=13,
+        pitch=0,
+    )
 
-fig.suptitle("Effect of Load and Power m on E50", fontsize=16)
-fig.tight_layout()
+    base_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=loca_df,
+        pickable=False,
+        get_position="[LON, LAT]",
+        get_radius=8,
+        get_fill_color="[200, 30, 0, 140]",
+        get_line_color="[0, 0, 0]",
+        line_width_min_pixels=1,
+    )
 
-with columns[2]:
-    st.pyplot(fig)
+# ---------------------- Lithology stick & controls --------------------
+with left_col:
+    st.subheader("Lithology")
+
+    # ---- dropdown + manual input -------------------------------------
+    id_options = sorted(loca_df["LOCA_ID"].astype(str).tolist())
+    dropdown_id = st.selectbox(
+        "Choose a borehole (Harwich only):",
+        [""] + id_options,
+        index=0,
+    )
+    manual_id = st.text_input("…or type a borehole ID:")
+    chosen_id = (manual_id.strip() or dropdown_id).strip()
+
+    # default – nothing selected
+    selected_row = pd.DataFrame()
+    layers = [base_layer]
+
+    if chosen_id == "":
+        st.markdown("_Select or type a borehole ID to see details._")
+
+    elif chosen_id not in id_options:
+        st.error(f"Borehole '{chosen_id}' does not exist in the filtered list.")
+
+    else:
+        # ------------- build lithology plot ---------------------------
+        intervals = geol_df[geol_df["LOCA_ID"] == chosen_id]\
+            .sort_values("GEOL_TOP")
+
+        numeric_cols = ["LOCA_GL", "GEOL_TOP", "GEOL_BASE"]
+        intervals[numeric_cols] = intervals[numeric_cols].apply(
+            pd.to_numeric, errors="coerce")
+        intervals = intervals[np.isfinite(intervals[numeric_cols]).all(axis=1)]
+
+        if intervals.empty:
+            st.warning("No plottable intervals for this borehole.")
+        else:
+            # axis limits only around logged part
+            ground_level = intervals.iloc[0]["LOCA_GL"]
+            top_od = ground_level - intervals["GEOL_TOP"]
+            base_od = ground_level - intervals["GEOL_BASE"]
+
+            axis_top = top_od.max() + 0.5
+            axis_bottom = base_od.min() - 0.5
+
+            fig, ax = plt.subplots(figsize=(2.2, 6))
+
+            for y_top, y_base, desc in zip(top_od, base_od,
+                                           intervals["COWI GEOL_4"]):
+                colour = DESC_COLOUR.get(desc, DEFAULT_COLOUR)
+                thickness = y_top - y_base
+                ax.add_patch(
+                    patches.Rectangle(
+                        (0.3, y_base), 0.4, thickness,
+                        facecolor=colour, edgecolor="black", linewidth=0.6
+                    )
+                )
+
+                txt = str(desc)
+                txt = txt[:12] + "…" if len(txt) > 12 else txt
+                if thickness >= 1.0:
+                    ax.text(0.5, (y_top + y_base) / 2, txt,
+                            ha="center", va="center", fontsize=8)
+                else:
+                    ax.text(0.75, (y_top + y_base) / 2, txt,
+                            ha="left", va="center", fontsize=7)
+
+            # dynamic tick spacing
+            span = axis_top - axis_bottom
+            tick_step = 1 if span <= 5 else (2 if span <= 20 else 5)
+            ticks = np.arange(np.floor(axis_bottom / tick_step) * tick_step,
+                              axis_top + tick_step, tick_step)
+
+            ax.set_ylim(axis_top, axis_bottom)   # ground level on top
+            ax.set_xlim(0, 1.1)
+            ax.set_yticks(ticks)
+            ax.set_ylabel("Elevation (m OD)")
+            ax.invert_yaxis()
+
+            ax.xaxis.set_visible(False)
+            ax.spines["right"].set_visible(False)
+            ax.spines["top"].set_visible(False)
+
+            st.pyplot(fig)
+
+            # interval table
+            st.markdown("**Interval table**")
+            st.dataframe(
+                pd.DataFrame({
+                    "Top Elev (m OD)": top_od,
+                    "Base Elev (m OD)": base_od,
+                    "Description": intervals["COWI GEOL_4"]
+                }),
+                hide_index=True,
+            )
+
+            # highlight on map
+            selected_row = loca_df[loca_df["LOCA_ID"] == chosen_id]
+            highlight_layer = pdk.Layer(
+                "ScatterplotLayer",
+                data=selected_row,
+                get_position="[LON, LAT]",
+                get_radius=15,
+                get_fill_color="[0, 0, 0, 255]",
+                get_line_color="[255, 255, 255]",
+                line_width_min_pixels=2,
+                pickable=False,
+            )
+            layers = [base_layer, highlight_layer]
+
+# ----------------------- Render the map --------------------------------
+with right_col:
+    deck = pdk.Deck(
+        map_style="mapbox://styles/mapbox/light-v9",
+        initial_view_state=view_state,
+        layers=layers,
+        tooltip={"text": "LOCA_ID: {LOCA_ID}"},
+    )
+    st.pydeck_chart(deck, use_container_width=True)
